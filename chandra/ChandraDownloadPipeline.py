@@ -12,7 +12,7 @@ from matplotlib.colors import LogNorm
 from astropy.wcs.utils import proj_plane_pixel_scales
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[0]
 
 
 class ChandraDataProcessor:
@@ -26,8 +26,9 @@ class ChandraDataProcessor:
         # Pipeline och data directories relativt project_root
         self.pipeline_dir = ROOT
         self.data_directory = os.path.join(project_root, "data", "chandra")
-        self.input_file = os.path.join(project_root, "sample", "test_chandra.txt")
-        #self.input_file = os.path.join(project_root, "sample", "cross_matches_optical_chandra_epoch_cuts_type_filtered.txt")
+        self.sample_dir = os.path.join(project_root, "sample")
+        #self.input_file = os.path.join(project_root, "sample", "test_chandra.txt")
+        self.input_file = os.path.join(project_root, "sample", "cross_matches_optical_chandra_epoch_cuts_type_filtered_data_quality_cuts.txt")
 
     @staticmethod
     def fk5_to_physical(fits_file:Path, ra:str, dec:str, r_arcsec:str):
@@ -61,8 +62,8 @@ class ChandraDataProcessor:
         x = (ra_deg - crval_x) * np.cos(np.deg2rad(dec_deg)) / cdelt_x + crpix_x
         y = (dec_deg - crval_y) / cdelt_y + crpix_y
         
-        arcsec_per_pixel = abs(hd['CDELT1']) * 3600.0
-        rad_pixl = r_arcsec / arcsec_per_pixel
+        arcsec_per_pixel = abs(cdelt_x) * 3600.0
+        rad_pixl = float(r_arcsec) / arcsec_per_pixel
 
         return x, y, rad_pixl
 
@@ -122,10 +123,12 @@ class ChandraDataProcessor:
         src_file = f"{self.data_directory}/{obsid}/repro/psfsize_src_{sn_name}_{obsid}.reg"
         ra_centre, dec_centre, radius_str = self.read_ds9_circle_region(src_file)
         radius_value = radius_str.replace('"', '')
-        xx, yy, rad_pixl = self.fk5_to_physical(ra_centre, dec_centre, radius_value)
+
+        fits_file_image = f"{self.data_directory}/{obsid}/repro/image_058_bin1.fits"
+        xx, yy, rad_pixl = self.fk5_to_physical(fits_file_image,ra_centre, dec_centre, radius_value)
 
         subprocess.run(
-            f"{self.pipeline_dir}/create_small_images.sh {sn_name} {obsid} {xx} {yy} {rad_pixl}",
+            f"{self.pipeline_dir}/create_small_images.sh {sn_name} {obsid} {xx} {yy} {rad_pixl*20}", ## OBS!! small image =20 gr radie av source reg
             shell=True,
             check=True
         )    
@@ -150,6 +153,66 @@ class ChandraDataProcessor:
         print(" ")
 
 
+
+    def plot_wavdetect_results(self, sn_name:str, obsid:str):
+        # FITS file with counts from wavdetect of found
+        fits_file = f'{self.data_directory}/{obsid}/repro/sources_058_wavdetect_{sn_name}.fits'#outfile_{name}.fits'
+
+        hdulist = fits.open(fits_file)
+        data = hdulist[1].data
+
+
+        # region file to check if it is indeed one of the detected
+        src_file = f"{self.data_directory}/{obsid}/repro/psfsize_src_{sn_name}_{obsid}.reg"
+        ra_centre, dec_centre, radius_str = self.read_ds9_circle_region(src_file)
+
+        # Parse the region string to get the region coordinates
+        region_coords = SkyCoord(ra=ra_centre, dec=dec_centre, frame='fk5', unit=(u.hourangle, u.deg)) 
+        RA, DEC = region_coords.ra.deg, region_coords.dec.deg 
+
+        # list all detected sources coordinates
+        sources_coords = SkyCoord(data['RA'],data['DEC'], frame='fk5', unit=(u.deg, u.deg))
+
+        if len(sources_coords)==0:
+            return float('NaN'),float('NaN'),float('NaN'),float('NaN')
+        else:
+            # find if there is a match with coordinates of detected sources and src_reg, by a separation limit
+            index_best, separation_best, _ = region_coords.match_to_catalog_sky(sources_coords)
+            closest_det_src_cord_RA, closest_det_src_cord_DEC = sources_coords[index_best].ra.deg, sources_coords[index_best].dec.deg
+            sep = separation_best.deg[0]
+
+            fig, ax = plt.subplots(1,1)
+            fig.subplots_adjust(left=0.15, right=0.95, bottom=0.12, top=0.92)
+            ax.set_xlabel('RA (degrees)')
+            ax.set_ylabel('DEC (degrees)')
+            p = ax.scatter(data['RA'], data['DEC'],s=data['SRC_SIGNIFICANCE']*10, c=data['SRC_SIGNIFICANCE'], cmap='viridis', marker='.')
+            p.set_clip_path(ax.patch)
+            for i in range(len(data['RA'])):
+                t = ax.text(data['RA'][i], data['DEC'][i], s=data['SRC_SIGNIFICANCE'][i])
+                t.set_clip_on(True)
+
+            ax.plot(float(RA),float(DEC),'+',color='red', markersize=8, label='SN pos.')
+            circle1 = plt.Circle((float(RA),float(DEC)),10/3600,color='red', fill=False, label='10" radi ')
+            ax.add_patch(circle1)
+
+        
+
+            ax.set_title(f'{sn_name}, {obsid}, min sep. {round(sep*3600,3)}", 3σ')
+
+            ax.plot([], [], ' ', label='FOV = 20" × 20"')
+            ax.legend()
+            ax.set_xlim([float(RA)-20/3600, float(RA)+20/3600])
+            ax.set_ylim([float(DEC)-20/3600, float(DEC)+20/3600])
+
+            #plt.show()
+            plt.savefig(f"{self.data_directory}/wavdetect_plots/{sn_name}_{obsid}.png")
+            plt.clf()
+
+            min_sep_arcsec = round(sep*3600,3)
+            min_sep_ra, min_sep_dec = closest_det_src_cord_RA, closest_det_src_cord_DEC
+            min_sep_significance = data['SRC_SIGNIFICANCE'][index_best]
+            
+            return min_sep_arcsec, min_sep_ra, min_sep_dec, min_sep_significance
 
     # --- Step 3 : Create src region via psfsize ---
     def extract_source_region(self, sn_name: str, obsid: str, ra:str, dec:str):
@@ -356,7 +419,7 @@ class ChandraDataProcessor:
         """Read input file containing obsids to download and reprocess."""
 
         # load Chandra data
-        chandra = os.path.join(self.input_file)
+        chandra = self.input_file
         cols_with_epoch_chandra = [
                     "index", "name", "type", "dist_Mpc", "ra", "dec", "optical_date",
                     "obsid", "sep_arcmin", "instr", "grating", "expt_ks",
@@ -368,12 +431,13 @@ class ChandraDataProcessor:
         for i,(sn_name,obsid) in enumerate(zip(df_chandra['name'],df_chandra['obsid'])):
             ra, dec = df_chandra['ra'][i], df_chandra['dec'][i]
 
+            df_row = df_chandra.iloc[i]
             print(f"Running for index:{df_chandra['index'][i]}")
 
             # if folder already downloaded, skip this step
             obsid_folder = os.path.join(self.data_directory)
 
-            if f"{obsid}" not in os.listdir(obsid_folder): # proceed
+            """if f"{obsid}" not in os.listdir(obsid_folder): # proceed
                 # 1. Download data
                 self.download_obsid(obsid)
                 
@@ -386,21 +450,28 @@ class ChandraDataProcessor:
             self.open_image_with_ds9(sn_name, obsid) # live time viewing image
 
             # 4. Generate background region
-            self.generate_bkg_region(sn_name, obsid)
+            self.generate_bkg_region(sn_name, obsid)"""
 
             # optional
             self.run_create_small_image(sn_name, obsid)
             self.run_wavdetect(sn_name, obsid)
+            min_sep_arcsec, min_sep_ra, min_sep_dec, min_sep_significance = self.plot_wavdetect_results(sn_name, obsid)
+            # save ewavelet output in separat txt file
+            with open(f"{self.sample_dir}/wavdetect_output.txt", "a") as ff:    
+                ff.write("\t".join(str(v) for v in df_row.values) + "\t")
+                ff.write(f"{min_sep_arcsec}\t{min_sep_ra}\t{min_sep_dec}\t{min_sep_significance}\n")
+            ff.close()
+
 
             # Open image with ds9
-            self.plot_save_image_with_src_bkg_reg(sn_name, obsid) # save output image
+            """self.plot_save_image_with_src_bkg_reg(sn_name, obsid) # save output image
 
             # 5. Extract spectrum
             src_zero_counts = self.spacextract_bash(df_chandra['index'][i],sn_name, obsid)
 
             if not src_zero_counts:
                 # 6. Calculate flux limits with srcflux
-                self.srcflux_bash(sn_name, obsid)
+                self.srcflux_bash(sn_name, obsid)"""
 
 
 pipeline = ChandraDataProcessor()
@@ -408,6 +479,7 @@ pipeline.process_spectra_from_input_file()
 
             
 os.chdir(ROOT)
+
 
 
 
