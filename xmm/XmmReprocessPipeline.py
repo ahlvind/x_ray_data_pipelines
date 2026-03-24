@@ -35,8 +35,8 @@ class XMMCrossMatchPipeline:
         self.pipeline_dir = ROOT
         self.data_directory = os.path.join(project_root, "data", "xmm")
         self.sample_dir =  os.path.join(project_root, "sample")
-        self.input_file = os.path.join(project_root, "sample", "test_xmm.txt")
-        #self.input_file = os.path.join(project_root, "sample", "cross_matches_optical_xmm_epoch_cuts_type_filtered.txt")
+        #self.input_file = os.path.join(project_root, "sample", "test_xmm.txt")
+        self.input_file = os.path.join(project_root, "sample", "cross_matches_optical_xmm_epoch_cuts_type_filtered_data_quality_cut.txt")
 
 
     @staticmethod
@@ -121,6 +121,7 @@ class XMMCrossMatchPipeline:
             return x, y ,r
         else:
             print("Ingen CIRCLE hittades")
+            return 0,0,0
 
     @staticmethod
     def read_ds9_circle_region(reg_file: str):
@@ -249,7 +250,6 @@ class XMMCrossMatchPipeline:
         
             outputs: 1. science files: image(obs_id_pn_img_filt_gti_05_10.fits), eventf(obs_id_pn_filt_gti_05_10.fits)
                      2. spectral files: name_obsid_pn_spec_grp_bin1.fits (name_obsid_pn_spec_bkg_bin1.fits, name_obsid_pn_rmf_bin1.fits, name_obsid_pn_arf_bin1.fits)
-                     3. ewavelet files: source_list05_10_pn_3σ_name_obs_id.fits
                      """
         print(f"Reprocessing first step for {sn_name} {obsid}...")
         subprocess.run(
@@ -289,7 +289,11 @@ class XMMCrossMatchPipeline:
 
         # print src region file
         ff = open(f"{self.data_directory}/{obsid}/src_{sn_name}_{obsid}.reg", 'w+')
-        ff.write(f"circle({x_physical_eregion},{y_physical_eregion},{radi_physical_eregion})")
+        if radi_physical_eregion==0:
+            print('eregion not possible')
+            ff.write(f"circle({x_physical},{y_physical},200)")#{radi_physical_eregion}
+        else:
+            ff.write(f"circle({x_physical_eregion},{y_physical_eregion},200)")#{radi_physical_eregion}
         ff.close()
 
         print(float(radi_physical_eregion))
@@ -420,6 +424,74 @@ class XMMCrossMatchPipeline:
         plt.savefig(f"{self.data_directory}/ds9_saves/{sn_name}_{obsid}.png")
         plt.clf()
 
+    def run_ewavelet(self, sn_name:str, obsid:str):
+        print(f"Running ewavelet for {sn_name} {obsid}...")
+        #output file. ewavelet files: source_list05_10_pn_3σ_name_obs_id.fits
+        
+        subprocess.run(
+            f"{self.pipeline_dir}/ewavelet.sh {obsid} {sn_name} ",
+            shell=True, # Python runs the command in shell-process eg bash
+            check=True # Python flags if bash command fails
+        )
+        
+    def _source_detection(self, obsid: str, sn_name: str, ra:str, dec:str):
+
+        hdul = fits.open(f'{self.data_directory}/{obsid}/source_list05_10_pn_3σ.fits')
+        data = hdul[1].data  
+        coord = SkyCoord(ra=ra, dec=dec, unit=(u.hourangle, u.deg)) # ra='16:09:39.11', dec='-32:03:45.63' for 2018bsz
+        RA,DEC = coord.ra.deg, coord.dec.deg 
+
+        fig, ax = plt.subplots(1,1)
+        fig.subplots_adjust(left=0.15, right=0.95, bottom=0.12, top=0.92)
+        ax.set_xlabel('RA (degrees)')
+        ax.set_ylabel('DEC (degrees)')
+    
+        p=ax.scatter(data['RA'], data['DEC'],s=data['EXTENT']*10, c=data['EXTENT'], cmap='viridis', marker='.',clip_on=True)
+        for i in range(len(data['RA'])):
+            t = ax.text(data['RA'][i], data['DEC'][i], i)
+            t.set_clip_on(True)
+
+        ax.plot(float(RA),float(DEC),'+',color='red', markersize=8, label='updated SN pos.')
+        circle1 = plt.Circle((float(RA),float(DEC)),20/3600,color='red', fill=False, label='20" radi ')
+        ax.add_patch(circle1)
+        ax.invert_xaxis()
+
+        source_detections_coord = SkyCoord(ra=data['RA'], dec=data['DEC'], unit=(u.deg, u.deg))
+
+        # find if there is a match with coordinates of detected sources and src_reg, by a separation limit
+        index_best, separation_best, _ = coord.match_to_catalog_sky(source_detections_coord)
+
+        closest_det_src_cord_RA, closest_det_src_cord_DEC = source_detections_coord[index_best].ra.deg,source_detections_coord[index_best].dec.deg
+
+        sig = data['SCTS'][index_best] # Net source counts corrected for PSF losses!!!
+        ext = data['EXTENT'][index_best]
+        sep = separation_best.deg[0]
+        WSCALE = data['WSCALE'][index_best]
+
+        ax.set_title(f'{sn_name}, {obsid}, min sep. {round(sep*3600,3)}", 3σ')
+
+        #print('Closest matching detected source:')
+        #print(f'sigma: {sig}')
+        #print(f'separation: {round(sep*3600,3)} arcsec')
+        #print(f'extent, physical coord: {ext}')
+        #print(f'coordinates, detected source: RA: {closest_det_src_cord_RA}, DEC: {closest_det_src_cord_DEC}')
+
+        ax.plot([], [], ' ', label="FOV = 2' × 2'")
+        ax.legend()
+        ax.set_xlim([float(RA)-2/60, float(RA)+2/60])
+        ax.set_ylim([float(DEC)-2/60, float(DEC)+2/60])
+        
+        
+        p.set_clip_path(ax.patch)
+        
+        plt.savefig(f"{self.data_directory}/ewavelet_plots/{sn_name}_{obsid}.png")
+        plt.clf()
+        #plt.show()
+
+        min_sep_arcsec = round(sep*3600,3)
+        min_sep_ra, min_sep_dec = closest_det_src_cord_RA, closest_det_src_cord_DEC
+        min_sep_extent_gauss_sig = ext
+        return min_sep_arcsec, min_sep_ra, min_sep_dec, min_sep_extent_gauss_sig
 
     def process_input_file(self):
         """Read input file containing obsids to download and reprocess."""
@@ -435,22 +507,24 @@ class XMMCrossMatchPipeline:
         for i,(sn_name,obsid) in enumerate(zip(df_xmm['name'],df_xmm['obsid'])):
             ra, dec = df_xmm['ra'][i], df_xmm['dec'][i]
 
+            df_row = df_xmm.iloc[i]
+
             print(f"Running for index:{df_xmm['index'][i]}")
             # if folder already downloaded, skip this step
             obsid_folder = os.path.join(self.project_root, "data", "xmm")
-            if obsid not in os.listdir(obsid_folder): # proceed
+            #if obsid not in os.listdir(obsid_folder): # proceed
 
                 # 1. Download data
-                self.download_xmm_data(obsid)
+            #    self.download_xmm_data(obsid)
                 
                 # 2. move and open all files
-                self.xmm_data_is_fantastic_so_this_is_what_i_have_to_do(obsid)
+            #    self.xmm_data_is_fantastic_so_this_is_what_i_have_to_do(obsid)
                     
                 # 3. reprocess the EPIC-pn/mos data
-                self.reprocess_xmm_EPIC_data(obsid, sn_name, preprocess=True)
+            #    self.reprocess_xmm_EPIC_data(obsid, sn_name, preprocess=True)
 
             #4. Create source regions
-            self.generte_src_region_file(sn_name, obsid, ra, dec)
+            #self.generte_src_region_file(sn_name, obsid, ra, dec)
 
             # 5. STOP!!
             # Check the sus src regions in large_src_flagged_src and adjust accordingly 
@@ -461,27 +535,32 @@ class XMMCrossMatchPipeline:
             #pattern = f"{sn_name}\t{obsid}"
             #match = re.search(pattern, text)
             #if match:
-            self.open_image_with_ds9(sn_name, obsid, ra, dec)
+            #self.open_image_with_ds9(sn_name, obsid, ra, dec)
 
-            input_continue = input("Input 'y' to continue with the next steps for this source, or 'n' to skip to the next source: ")
+            #input_continue = input("Input 'y' to continue with the next steps for this source, or 'n' to skip to the next source: ")
 
-            if input_continue.lower() == 'y':
+            #if input_continue.lower() == 'y':
 
                 # 6. Create background region annulus
-                self.generate_bkg_region(sn_name, obsid)
+            #    self.generate_bkg_region(sn_name, obsid)
 
                 # plot ds9 image with src and bkg regions witout vewing it live -> store image
-                self.plot_save_image_with_src_bkg_reg(sn_name,obsid)
+            #    self.plot_save_image_with_src_bkg_reg(sn_name,obsid)
 
                 # 7. Generate spectra
-                self.reprocess_xmm_EPIC_data(obsid, sn_name, preprocess=False)
+            #    self.reprocess_xmm_EPIC_data(obsid, sn_name, preprocess=False)
 
             # Optional. Run edetect for image source detection
-            #self.reprocess_xmm_EPIC_data(obsid, sn_name, preprocess='false', run_ewavelet=True)
+            obsid_folder=os.path.join(self.data_directory, obsid)
+            if "source_list05_10_pn_3σ.fits" not in os.listdir(obsid_folder):
+                self.run_ewavelet(sn_name, obsid)
 
-
-
-
+            min_sep_arcsec, min_sep_ra, min_sep_dec, min_sep_extent_gauss_sig = self._source_detection(obsid, sn_name, ra, dec)
+            # save ewavelet output in separat txt file
+            with open(f"{self.sample_dir}/ewavelet_output.txt", "a") as ff:    
+                ff.write("\t".join(str(v) for v in df_row.values) + "\t")
+                ff.write(f"{min_sep_arcsec}\t{min_sep_ra}\t{min_sep_dec}\t{min_sep_extent_gauss_sig}\n")
+            ff.close()
 
 
 
@@ -490,6 +569,38 @@ pipeline.process_input_file()
 
             
 os.chdir("/Users/juliaahlvind/Documents/projekt_3/pipelines")
+
+
+
+
+
+
+"""
+xmm = "/Users/juliaahlvind/Documents/projekt_3/sample/cross_matches_optical_xmm_epoch_cuts_type_filtered_data_quality_cut.txt"
+cols_with_epoch_xmm = ["index", "name", "type", "dist_Mpc", "ra", "dec", "optical_date",
+                        "obsid", "sep_arcmin", "expt_ks", "X_ray_obs_date", "epoch_days",
+                        "PIname", "target"]
+df_xmm = pd.read_csv(xmm, sep="\t", skiprows=1, names=cols_with_epoch_xmm, dtype={"obsid": str})
+
+#215 obs, 43 unique
+
+chandra = "/Users/juliaahlvind/Documents/projekt_3/sample/cross_matches_optical_chandra_epoch_cuts_type_filtered_data_quality_cuts.txt"
+cols_with_epoch_chandra = ["index",	"name",	"type"	,"dist",	"ra",	"dec",	"optical_date",	"obsid",	"sep_arcmin",	"instr",	"grating",	"expt_ks",	"X_ray_obs_date",	"epoch_days",	"PIname",	"target"]
+df_chandra = pd.read_csv(chandra, sep="\t", skiprows=1, names=cols_with_epoch_chandra, dtype={"obsid": str})
+
+df_combined = pd.concat([df_xmm, df_chandra], ignore_index=True)
+print('number of obs chandra:',len(df_chandra))
+print('number of SN chandra:',len(df_chandra['name'].unique()))
+print('---------------')
+print('number of obs xmm:',len(df_xmm))
+print('number of SN xmm:',len(df_xmm['name'].unique()))
+print('---------------')
+print('number of obs totoal:',len(df_combined))
+print('number of SN total:',len(df_combined['name'].unique()))
+"""
+
+
+
 
 
 
